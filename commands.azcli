@@ -23,7 +23,13 @@ vnetOnPremName="onpremvnet"
 vnetOnPremAddressPrefix="10.0.0.0/16"
 subnetOnPremName="subnet1"
 subnetOnPremAddressPrefix="10.0.0.0/24"
-vnetPeerName="PeerOnPremtoAzure"
+vnetPeerOnPremtoAzureName="PeerOnPremtoAzure"
+vnetPeerAzuretoOnPremName="PeerAzuretoOnPrem"
+
+subnetBastionName="AzureBastionSubnet"
+subnetBastionPrefix="10.0.1.0/24"
+bastionIPName="pipBastion1"
+bastionName="bastion1"
 
 # create resource group
 az group create -l $location -n $resourceGroupName
@@ -43,8 +49,16 @@ vnetOnPremSubnetId=`az network vnet subnet show --resource-group $resourceGroupN
 vnetOnPremSubnetId=`eval echo $vnetOnPremSubnetId`
 echo $vnetOnPremSubnetId
 
+az network vnet subnet create --name $subnetBastionName --resource-group $resourceGroupName --vnet-name $vnetOnPremName --address-prefixes $subnetBastionPrefix
+
 # Peer vnets
-az network vnet peering create --name $vnetPeerName --resource-group $resourceGroupName --vnet-name $vnetAzureName --remote-vnet $vnetOnPremName --allow-vnet-access
+az network vnet peering create --name $vnetPeerOnPremtoAzureName --resource-group $resourceGroupName --vnet-name $vnetAzureName --remote-vnet $vnetOnPremName --allow-vnet-access
+az network vnet peering create --name $vnetPeerAzuretoOnPremName --resource-group $resourceGroupName --vnet-name $vnetOnPremName --remote-vnet $vnetAzureName --allow-vnet-access
+
+# create bastion
+az network public-ip create -g $resourceGroupName -n $bastionIPName --sku Standard --zone 1 
+az network bastion create --location $location --name $bastionName --public-ip-address $bastionIPName --resource-group $resourceGroupName --vnet-name $vnetOnPremName
+
 
 # Powershell commands due to Azure Private DNS Resolver being in preview (Open PowerShell Terminal)
 Install-Module Az.DnsResolver              ## Run as administrator in Powershell via Terminal
@@ -62,10 +76,17 @@ $endpointInboundName="azurednsinboudendpoint"
 $endpointOutboundName="azurednsoutboudendpoint"
 $dnsResolverName="azureDNSResolver"
 $endpointInboundIP="172.16.1.4"
+$dnsOutboundRulesetName="outboundRuleSet1"
+$dnsOutboundVnetLinkName1="dnsOutboundVnetLink1"
+$dnsOutboundForwardingRule1="dnsOutboundForwardingRule1"
+$AdDomainName="dnstest.local."
 
 # Connect to Azure and Set subscription
 Connect-AzAccount -Environment AzureCloud
-Select-AzSubscription -SubscriptionObject (Get-AzSubscription -SubscriptionName $subscriptionName)
+$subscriptionObject = Get-AzSubscription -SubscriptionName $subscriptionName
+Select-AzSubscription -SubscriptionObject $subscriptionObject
+$subscriptionId = $subscriptionObject.Id
+
 Register-AzResourceProvider -ProviderNamespace Microsoft.Network
 
 # Get previously created vnet and subnet ids
@@ -82,37 +103,28 @@ $ipconfigInbound = New-AzDnsResolverIPConfigurationObject -PrivateIPAllocationMe
 New-AzDnsResolverInboundEndpoint -DnsResolverName $dnsResolverName -Name $endpointInboundName -ResourceGroupName $resourceGroupName -Location $location -IpConfiguration $ipconfigInbound
 New-AzDnsResolverOutboundEndpoint -DnsResolverName $dnsResolverName -Name $endpointOutboundName -ResourceGroupName $resourceGroupName -Location $location -SubnetId $subnetAzureOutboundId
 
+# Create outbound ruleset
+$endpointOutboundObject=(Get-AzDnsResolverOutboundEndpoint -Name $endpointOutboundName -DnsResolverName $dnsResolverName -ResourceGroupName $resourceGroupName)
+$dnsOutboundRulesetObject=(New-AzDnsForwardingRuleset -Name $dnsOutboundRulesetName -ResourceGroupName $resourceGroupName -DnsResolverOutboundEndpoint $endpointOutboundObject -Location $location)
 
-# build private AKS cluster
-# https://docs.microsoft.com/en-us/azure/aks/private-clusters
-# 
-az aks create -n $aksClusterName -g $resourceGroupName --load-balancer-sku standard --enable-private-cluster --node-count 1 --network-plugin kubenet --vnet-subnet-id $vnetSubnetId --disable-public-fqdn
+# Link DNS forwarding ruleset to azure vnet
+$dnsOutboundVnetLink = New-AzDnsForwardingRulesetVirtualNetworkLink -DnsForwardingRulesetName $dnsOutboundRulesetName -ResourceGroupName $resourceGroupName -VirtualNetworkLinkName $dnsOutboundVnetLinkName1 -VirtualNetworkId $vnetAzureId -SubscriptionId $subscriptionObject
 
-# build azure bastion
-# https://docs.microsoft.com/en-us/azure/bastion/create-host-cli
-az network public-ip create --resource-group $resourceGroupName --name $pipName --sku Standard --location $location --zone 1
-az network vnet subnet create --name $azureBastionSubnetName --address-prefixes $azureBastionSubnetPrefix --resource-group $resourceGroupName --vnet-name $vnetName
-az network bastion create --name $bastionName --public-ip-address $pipName --resource-group $resourceGroupName --vnet-name $vnetName --location $location --sku Standard
-# Enable "Native Client Support" in Bastion from Portal for now (until CLI supports)
+# Forwarding Rules
+$targetDNS1 = New-AzDnsResolverTargetDnsServerObject -IPAddress 10.0.0.4 -Port 53
+$forwardingrule1 = New-AzDnsForwardingRulesetForwardingRule -ResourceGroupName $resourceGroupName -DnsForwardingRulesetName $dnsOutboundRulesetName -Name $dnsOutboundForwardingRule1 -DomainName $AdDomainName -ForwardingRuleState "Enabled" -TargetDnsServer $targetDNS1
 
-# build jump vm
-echo $sshKeyPath
-ssh-keygen -f $sshKeyPath -N ""
-eval `chmod 500 ${sshKeyPath}*`
-eval ls -al $sshKeyPath
-
-# az vm create --resource-group $resourceGroupName --name $vmName --image $vmImage --admin-username $vmAdminUserName --generate-ssh-keys --public-ip-address "" --location $location --vnet-name $vnetName --subnet $subnetName
-az vm create --resource-group $resourceGroupName --name $vmName --image $vmImage --admin-username $vmAdminUserName --ssh-key-values $sshKeyPath --public-ip-address "" --location $location --vnet-name $vnetName --subnet $subnetName
-vmResourceId=`az vm show --name $vmName --resource-group $resourceGroupName --query "id"`
-vmResourceId=`eval echo $vmResourceId`
-echo $vmResourceId
+# Create Storage Account with private link in Azure VNET (manually since not very straightforward with az cli) 
 
 
+# build a windows VM in Azure VNET
+# (got lazy here and did manually)
 
-# connect to vm using bastion ssh
-az extension add --name ssh
-az network bastion ssh --name $bastionName --resource-group $resourceGroupName --target-resource-id $vmResourceId --auth-type "ssh-key" --username $vmAdminUserName --ssh-key $sshKeyPath
+# build a domain controller Vm in the on-prem vnet in subnet 1 (got lazy here and did manually)
+# Promote to DC
 
-az network bastion tunnel --name $bastionName --resource-group $resourceGroupName --target-resource-id $vmResourceId --resource-port 22 --port 50022
-
-az aks get-credentials --resource-group $resourceGroupName --name $aksClusterName
+# confirm ping between VMs
+# set AD DC forward to DNS resolver inbound endpoint
+# set outbound ruleset for AD non-routable domain to AD Domain Server IP Address
+# Join domain (ensure azure VM uses azure DNS (the forwarding ruleset will send dns to domain controller))
+# confirm azure ad vm can hit private link using forwarder to inbound dns forwarder
