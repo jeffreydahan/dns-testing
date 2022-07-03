@@ -1,0 +1,118 @@
+# Login and set subscription for deployment
+az login
+subscriptionId=`az account list --query "[?name=='Jeff Dahan - MS Internal'].id | [0]"`
+subscriptionId=`eval echo $subscriptionId`
+echo $subscriptionId
+az account set --subscription ${subscriptionId}
+
+# Set variables; this works better if you pre-create vnet
+location="westeurope"
+resourceGroupName="dns-testing"
+vnetAzureName="azurevnet"
+vnetAzureAddressPrefix="172.16.0.0/16"
+subnetAzureName="subnet1"
+subnetAzureAddressPrefix="172.16.0.0/24"
+
+subnetAzureDNSInboundName="azurednsinboud"
+subnetAzureDNSInboundPrefix="172.16.1.0/25"
+subnetAzureDNSOutboundName="azurednsoutbound"
+subnetAzureDNSOutboundPrefix="172.16.1.128/25"
+
+
+vnetOnPremName="onpremvnet"
+vnetOnPremAddressPrefix="10.0.0.0/16"
+subnetOnPremName="subnet1"
+subnetOnPremAddressPrefix="10.0.0.0/24"
+vnetPeerName="PeerOnPremtoAzure"
+
+# create resource group
+az group create -l $location -n $resourceGroupName
+
+# create Azure vnet
+az network vnet create --name $vnetAzureName --resource-group $resourceGroupName --subnet-name $subnetAzureName --address-prefixes $vnetAzureAddressPrefix --subnet-prefixes $subnetAzureAddressPrefix
+vnetAzureSubnetId=`az network vnet subnet show --resource-group $resourceGroupName --name $subnetAzureName --vnet-name $vnetAzureName --query "id"`
+vnetAzureSubnetId=`eval echo $vnetAzureSubnetId`
+echo $vnetAzureSubnetId
+
+az network vnet subnet create --name $subnetAzureDNSInboundName --resource-group $resourceGroupName --vnet-name $vnetAzureName --address-prefixes $subnetAzureDNSInboundPrefix
+az network vnet subnet create --name $subnetAzureDNSOutboundName --resource-group $resourceGroupName --vnet-name $vnetAzureName --address-prefixes $subnetAzureDNSOutboundPrefix
+
+# create OnPrem vnet
+az network vnet create --name $vnetOnPremName --resource-group $resourceGroupName --subnet-name $subnetOnPremName --address-prefixes $vnetOnPremAddressPrefix --subnet-prefixes $subnetOnPremAddressPrefix
+vnetOnPremSubnetId=`az network vnet subnet show --resource-group $resourceGroupName --name $subnetOnPremName --vnet-name $vnetOnPremName --query "id"`
+vnetOnPremSubnetId=`eval echo $vnetOnPremSubnetId`
+echo $vnetOnPremSubnetId
+
+# Peer vnets
+az network vnet peering create --name $vnetPeerName --resource-group $resourceGroupName --vnet-name $vnetAzureName --remote-vnet $vnetOnPremName --allow-vnet-access
+
+# Powershell commands due to Azure Private DNS Resolver being in preview (Open PowerShell Terminal)
+Install-Module Az.DnsResolver              ## Run as administrator in Powershell via Terminal
+Get-InstalledModule -Name Az.DnsResolver   ## Run as administrator in Powershell via Terminal
+
+## Open Powershell Terminal as usual in VS Code
+# Variables
+$subscriptionName="" # Insert your Subscription Name here
+$location="westeurope"
+$resourceGroupName="dns-testing"
+$vnetAzureName="azurevnet"
+$subnetAzureDNSInboundName="azurednsinboud"
+$subnetAzureDNSOutboundName="azurednsoutbound"
+$endpointInboundName="azurednsinboudendpoint"
+$endpointOutboundName="azurednsoutboudendpoint"
+$dnsResolverName="azureDNSResolver"
+$endpointInboundIP="172.16.1.4"
+
+# Connect to Azure and Set subscription
+Connect-AzAccount -Environment AzureCloud
+Select-AzSubscription -SubscriptionObject (Get-AzSubscription -SubscriptionName $subscriptionName)
+Register-AzResourceProvider -ProviderNamespace Microsoft.Network
+
+# Get previously created vnet and subnet ids
+$vnetAzureObject=(Get-AzVirtualNetwork -Name $vnetAzureName -ResourceGroupName $resourceGroupName)
+$vnetAzureId=$vnetAzureObject.Id
+$subnetAzureInboundId=(Get-AzVirtualNetworkSubnetConfig -Name $subnetAzureDNSInboundName -VirtualNetwork $vnetAzureObject).Id
+$subnetAzureOutboundId=(Get-AzVirtualNetworkSubnetConfig -Name $subnetAzureDNSOutboundName -VirtualNetwork $vnetAzureObject).Id
+
+# Create new DNS Resolver
+New-AzDnsResolver -Name $dnsResolverName -ResourceGroupName $resourceGroupName -Location $location -VirtualNetworkId $vnetAzureId
+
+# Create DNS Resolver Inbound/Outbound endpoints
+$ipconfigInbound = New-AzDnsResolverIPConfigurationObject -PrivateIPAllocationMethod Dynamic -SubnetId $subnetAzureInboundId
+New-AzDnsResolverInboundEndpoint -DnsResolverName $dnsResolverName -Name $endpointInboundName -ResourceGroupName $resourceGroupName -Location $location -IpConfiguration $ipconfigInbound
+New-AzDnsResolverOutboundEndpoint -DnsResolverName $dnsResolverName -Name $endpointOutboundName -ResourceGroupName $resourceGroupName -Location $location -SubnetId $subnetAzureOutboundId
+
+
+# build private AKS cluster
+# https://docs.microsoft.com/en-us/azure/aks/private-clusters
+# 
+az aks create -n $aksClusterName -g $resourceGroupName --load-balancer-sku standard --enable-private-cluster --node-count 1 --network-plugin kubenet --vnet-subnet-id $vnetSubnetId --disable-public-fqdn
+
+# build azure bastion
+# https://docs.microsoft.com/en-us/azure/bastion/create-host-cli
+az network public-ip create --resource-group $resourceGroupName --name $pipName --sku Standard --location $location --zone 1
+az network vnet subnet create --name $azureBastionSubnetName --address-prefixes $azureBastionSubnetPrefix --resource-group $resourceGroupName --vnet-name $vnetName
+az network bastion create --name $bastionName --public-ip-address $pipName --resource-group $resourceGroupName --vnet-name $vnetName --location $location --sku Standard
+# Enable "Native Client Support" in Bastion from Portal for now (until CLI supports)
+
+# build jump vm
+echo $sshKeyPath
+ssh-keygen -f $sshKeyPath -N ""
+eval `chmod 500 ${sshKeyPath}*`
+eval ls -al $sshKeyPath
+
+# az vm create --resource-group $resourceGroupName --name $vmName --image $vmImage --admin-username $vmAdminUserName --generate-ssh-keys --public-ip-address "" --location $location --vnet-name $vnetName --subnet $subnetName
+az vm create --resource-group $resourceGroupName --name $vmName --image $vmImage --admin-username $vmAdminUserName --ssh-key-values $sshKeyPath --public-ip-address "" --location $location --vnet-name $vnetName --subnet $subnetName
+vmResourceId=`az vm show --name $vmName --resource-group $resourceGroupName --query "id"`
+vmResourceId=`eval echo $vmResourceId`
+echo $vmResourceId
+
+
+
+# connect to vm using bastion ssh
+az extension add --name ssh
+az network bastion ssh --name $bastionName --resource-group $resourceGroupName --target-resource-id $vmResourceId --auth-type "ssh-key" --username $vmAdminUserName --ssh-key $sshKeyPath
+
+az network bastion tunnel --name $bastionName --resource-group $resourceGroupName --target-resource-id $vmResourceId --resource-port 22 --port 50022
+
+az aks get-credentials --resource-group $resourceGroupName --name $aksClusterName
